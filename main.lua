@@ -1,108 +1,56 @@
 -- ==========================================
--- SCRIPT: Double Rate 100% - NO LIMITATIONS
--- PHƯƠNG PHÁP: Can thiệp CẢ FireServer VÀ OnClientEvent
---              + Money Refund tự động
---              + Phát hiện mọi dạng kết quả
+-- SCRIPT: Double Rate 100% - MOBILE EDITION
+-- TỐI ƯU: Cảm ứng, nút to, dễ bấm
+-- GIAO DIỆN: Switch toggle + full touch
 -- ==========================================
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
 local LocalPlayer = Players.LocalPlayer
 local VirtualUser = game:GetService("VirtualUser")
 
-local IsActive = true
+-- State
+local IsEnabled = true
 local OriginalMathRandom = math.random
+local Connections = {}
 local MoneyValue = nil
 local LastMoney = 0
-local RefundActive = false -- Cờ chống vòng lặp hoàn tiền
+local MoneyRemote = nil
+local DoubleCount = 0
+local FailBlocked = 0
 
 -- ==========================================
--- BƯỚC 1: TÌM MONEY VALUE TRONG LEADERSTATS
+-- CORE: TÌM TIỀN
 -- ==========================================
 local function FindMoney()
     local ls = LocalPlayer:FindFirstChild("leaderstats")
     if not ls then ls = LocalPlayer:WaitForChild("leaderstats", 10) end
     if not ls then return nil end
-    
-    for _, child in ipairs(ls:GetChildren()) do
-        if child:IsA("IntValue") or child:IsA("DoubleValue") or child:IsA("NumberValue") then
-            local name = child.Name:lower()
-            if name:find("coin") or name:find("cash") or name:find("money") or 
-               name:find("gem") or name:find("gold") or name:find("point") or
-               name:find("balance") or name:find("currency") then
-                return child
+    for _, c in ipairs(ls:GetChildren()) do
+        if c:IsA("IntValue") then
+            local n = c.Name:lower()
+            if n:find("coin") or n:find("cash") or n:find("money") or n:find("gem") then
+                return c
             end
         end
     end
-    
-    -- Fallback: IntValue đầu tiên
-    for _, child in ipairs(ls:GetChildren()) do
-        if child:IsA("IntValue") then
-            return child
-        end
+    for _, c in ipairs(ls:GetChildren()) do
+        if c:IsA("IntValue") then return c end
     end
-    
     return nil
 end
 
 -- ==========================================
--- BƯỚC 2: TÌM REMOTE LIÊN QUAN ĐẾN DOUBLE/SELL
--- ==========================================
-local function FindDoubleRemotes()
-    local fireTargets = {} -- Remote để gửi yêu cầu
-    local receiveTargets = {} -- Remote để nhận kết quả
-    
-    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-        if obj:IsA("RemoteEvent") then
-            local name = obj.Name:lower()
-            local path = obj:GetFullName():lower()
-            
-            -- Remote gửi yêu cầu Double/Sell
-            if name:find("double") or name:find("sell") or name:find("don") or
-               name:find("gamble") or name:find("harvest") or name:find("bet") or
-               path:find("double") or path:find("sell") or path:find("gamble") then
-                table.insert(fireTargets, obj)
-            end
-            
-            -- Remote nhận kết quả
-            if name:find("result") or name:find("outcome") or name:find("reward") or
-               name:find("response") or name:find("callback") or
-               path:find("result") or path:find("outcome") then
-                table.insert(receiveTargets, obj)
-            end
-        end
-        
-        if obj:IsA("RemoteFunction") then
-            local name = obj.Name:lower()
-            local path = obj:GetFullName():lower()
-            
-            if name:find("double") or name:find("sell") or name:find("don") or
-               name:find("gamble") or name:find("result") or name:find("outcome") or
-               path:find("double") or path:find("sell") then
-                table.insert(fireTargets, obj)
-                table.insert(receiveTargets, obj)
-            end
-        end
-    end
-    
-    return fireTargets, receiveTargets
-end
-
--- ==========================================
--- BƯỚC 3: TÌM REMOTE CẬP NHẬT TIỀN TRỰC TIẾP
+-- CORE: TÌM MONEY REMOTE
 -- ==========================================
 local function FindMoneyRemote()
     for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
         if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
-            local name = obj.Name:lower()
-            local path = obj:GetFullName():lower()
-            
-            -- Tìm event cập nhật tiền cụ thể
-            if name == "addcoins" or name == "addcash" or name == "givemoney" or
-               name == "addmoney" or name == "updatecoins" or name == "rewardcoins" or
-               name == "setcoins" or name == "changemoney" or
-               path:find("currency") or path:find("coin") or path:find("money") then
+            local n = obj.Name:lower()
+            if n:find("addcoin") or n:find("addcash") or n:find("givemoney") or
+               n:find("addmoney") or n:find("updatecoin") or n:find("rewardcoin") then
                 return obj
             end
         end
@@ -111,295 +59,390 @@ local function FindMoneyRemote()
 end
 
 -- ==========================================
--- BƯỚC 4: HOOK TẤT CẢ ONCLIENTEVENT (MỌI DẠNG KẾT QUẢ)
+-- CORE: GỬI TIỀN SERVER
 -- ==========================================
-local function HookAllResults(receiveTargets)
-    local hooked = 0
-    
-    -- Nếu không tìm thấy receiveTargets cụ thể, hook TẤT CẢ RemoteEvent
-    local targets = #receiveTargets > 0 and receiveTargets or {}
-    if #targets == 0 then
-        for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-            if obj:IsA("RemoteEvent") then
-                table.insert(targets, obj)
-            end
-        end
-    end
-    
-    for _, remote in ipairs(targets) do
-        pcall(function()
-            if remote:IsA("RemoteEvent") then
-                local conn = remote.OnClientEvent:Connect(function(...)
-                    local args = {...}
-                    local modified = false
-                    local moneyAmount = nil
-                    
-                    -- Quét tất cả tham số
-                    for i = 1, #args do
-                        local arg = args[i]
-                        
-                        -- Dạng 1: Chuỗi NOTHING/LOSE/FAIL
-                        if type(arg) == "string" then
-                            local upper = arg:upper()
-                            if upper == "NOTHING" or upper == "LOSE" or upper == "FAIL" or upper == "FALSE" then
-                                args[i] = "DOUBLE"
-                                modified = true
-                            end
-                        end
-                        
-                        -- Dạng 2: Boolean false
-                        if type(arg) == "boolean" and arg == false then
-                            args[i] = true
-                            modified = true
-                        end
-                        
-                        -- Dạng 3: Số 0 (thua, không nhận được gì)
-                        if type(arg) == "number" and arg == 0 then
-                            -- Tìm số tiền lẽ ra nhận được
-                            for j = 1, #args do
-                                if j ~= i and type(args[j]) == "number" and args[j] > 0 then
-                                    args[i] = args[j] * 2
-                                    modified = true
-                                    moneyAmount = args[i]
-                                    break
-                                end
-                            end
-                        end
-                        
-                        -- Lưu số tiền nếu có
-                        if type(arg) == "number" and arg > 0 then
-                            moneyAmount = arg
-                        end
-                    end
-                    
-                    if modified then
-                        print(string.format("[Hook] Kết quả bị sửa trong: %s", remote:GetFullName()))
-                    end
-                    
-                    -- Nếu có số tiền, cố gắng gửi lên Server
-                    if moneyAmount and moneyAmount > 0 then
-                        SendMoneyToServer(moneyAmount)
-                    end
-                end)
-                
-                hooked = hooked + 1
-                
-            elseif remote:IsA("RemoteFunction") then
-                local conn = remote.OnClientInvoke:Connect(function(...)
-                    local args = {...}
-                    
-                    if #args >= 1 then
-                        if type(args[1]) == "string" then
-                            local upper = args[1]:upper()
-                            if upper == "NOTHING" or upper == "LOSE" or upper == "FAIL" then
-                                local amount = (args[2] or 100) * 2
-                                SendMoneyToServer(amount)
-                                return "DOUBLE", amount
-                            end
-                        end
-                        if type(args[1]) == "boolean" and args[1] == false then
-                            local amount = (args[2] or 100) * 2
-                            SendMoneyToServer(amount)
-                            return true, amount
-                        end
-                        if type(args[1]) == "number" and args[1] == 0 and #args >= 2 then
-                            local amount = args[2] * 2
-                            SendMoneyToServer(amount)
-                            return amount, amount
-                        end
-                    end
-                    return nil
-                end)
-                
-                hooked = hooked + 1
-            end
-        end)
-    end
-    
-    return hooked
-end
-
--- ==========================================
--- BƯỚC 5: GỬI TIỀN LÊN SERVER (ĐA PHƯƠNG PHÁP)
--- ==========================================
-local MoneyRemote = nil
-
-local function SendMoneyToServer(amount)
+local function SendMoney(amount)
     if not amount or amount <= 0 then return end
-    if RefundActive then return end -- Chống vòng lặp
-    
-    RefundActive = true
-    
-    -- Tìm MoneyRemote nếu chưa có
-    if not MoneyRemote then
-        MoneyRemote = FindMoneyRemote()
-    end
-    
-    -- Phương pháp A: MoneyRemote trực tiếp
     if MoneyRemote then
         pcall(function()
             if MoneyRemote:IsA("RemoteEvent") then
                 MoneyRemote:FireServer(amount)
-                print(string.format("[SendMoney] A: FireServer %d qua %s", amount, MoneyRemote.Name))
-            elseif MoneyRemote:IsA("RemoteFunction") then
+            else
                 MoneyRemote:InvokeServer(amount)
-                print(string.format("[SendMoney] A: InvokeServer %d qua %s", amount, MoneyRemote.Name))
             end
         end)
     end
-    
-    -- Phương pháp B: Cập nhật trực tiếp leaderstats (Client-side)
     if MoneyValue then
-        pcall(function()
-            MoneyValue.Value = MoneyValue.Value + amount
-            print(string.format("[SendMoney] B: Client-side +%d", amount))
-        end)
+        pcall(function() MoneyValue.Value = MoneyValue.Value + amount end)
     end
-    
-    task.wait(0.5)
-    RefundActive = false
 end
 
 -- ==========================================
--- BƯỚC 6: THEO DÕI LEADERSTATS (PHÁT HIỆN THUA)
+-- CORE: HOOK REMOTE EVENT
 -- ==========================================
-local function MonitorMoneyChanges()
-    MoneyValue = FindMoney()
-    if not MoneyValue then
-        print("[Monitor] KHÔNG tìm thấy tiền!")
-        return
-    end
-    
-    LastMoney = MoneyValue.Value
-    print(string.format("[Monitor] Theo dõi: %s = %d", MoneyValue.Name, LastMoney))
-    
-    MoneyValue.Changed:Connect(function(newValue)
-        local diff = newValue - LastMoney
-        
-        if diff < 0 then
-            -- Tiền GIẢM = Double thất bại
-            local lost = math.abs(diff)
-            print(string.format("[Monitor] ❌ MẤT %d coin! (Double thất bại)", lost))
-            
-            -- Hoàn lại gấp đôi
-            local refund = lost * 2
-            print(string.format("[Monitor] 🔄 Hoàn lại: %d coin", refund))
-            SendMoneyToServer(refund)
-            
-        elseif diff > 0 then
-            print(string.format("[Monitor] ✅ Nhận: +%d coin", diff))
+local function HookAll()
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteEvent") then
+            pcall(function()
+                local conn = obj.OnClientEvent:Connect(function(...)
+                    if not IsEnabled then return end
+                    local args = {...}
+                    local changed = false
+                    local amount = nil
+                    for i = 1, #args do
+                        local arg = args[i]
+                        if type(arg) == "string" then
+                            local u = arg:upper()
+                            if u == "NOTHING" or u == "LOSE" or u == "FAIL" then
+                                args[i] = "DOUBLE"; changed = true
+                            end
+                        end
+                        if type(arg) == "boolean" and arg == false then
+                            args[i] = true; changed = true
+                        end
+                        if type(arg) == "number" and arg == 0 then
+                            for j = 1, #args do
+                                if j ~= i and type(args[j]) == "number" and args[j] > 0 then
+                                    args[i] = args[j] * 2; amount = args[i]; changed = true; break
+                                end
+                            end
+                        end
+                        if type(arg) == "number" and arg > 0 then amount = arg end
+                    end
+                    if changed then
+                        FailBlocked = FailBlocked + 1
+                        DoubleCount = DoubleCount + 1
+                        if amount then SendMoney(amount) end
+                    end
+                end)
+                table.insert(Connections, conn)
+            end)
         end
-        
-        LastMoney = MoneyValue.Value
+    end
+end
+
+-- ==========================================
+-- CORE: MONITOR TIỀN
+-- ==========================================
+local function MonitorMoney()
+    MoneyValue = FindMoney()
+    if not MoneyValue then return end
+    LastMoney = MoneyValue.Value
+    MoneyValue.Changed:Connect(function(v)
+        if not IsEnabled then LastMoney = v; return end
+        local diff = v - LastMoney
+        if diff < 0 then
+            SendMoney(math.abs(diff) * 2)
+            FailBlocked = FailBlocked + 1
+            DoubleCount = DoubleCount + 1
+        elseif diff > 0 then
+            DoubleCount = DoubleCount + 1
+        end
+        LastMoney = v
     end)
 end
 
 -- ==========================================
--- BƯỚC 7: GHI ĐÈ MATH.RANDOM
+-- CORE: MATH HOOK
 -- ==========================================
-math.random = function(...)
-    local count = select("#", ...)
-    if count == 0 then
-        return OriginalMathRandom() * 0.39
-    elseif count == 1 then
-        return ...
-    elseif count == 2 then
-        return select(2, ...)
-    end
-    return OriginalMathRandom(...)
-end
-
--- ==========================================
--- KHỞI CHẠY
--- ==========================================
-print([[
-============================================
-  DOUBLE 100% - FULL METHOD
-  Không giới hạn - Mọi dạng kết quả
-============================================
-]])
-
--- Tìm Money
-MoneyValue = FindMoney()
-if MoneyValue then
-    print(string.format("[Init] Tiền: %s = %d", MoneyValue.Name, MoneyValue.Value))
-else
-    print("[Init] CẢNH BÁO: Không tìm thấy tiền!")
-end
-
--- Tìm Remotes
-local fireTargets, receiveTargets = FindDoubleRemotes()
-print(string.format("[Init] FireTargets: %d, ReceiveTargets: %d", #fireTargets, #receiveTargets))
-
--- In ra để debug
-if #fireTargets > 0 then
-    print("[Init] FireTargets tìm thấy:")
-    for i, r in ipairs(fireTargets) do
-        print(string.format("  [%d] %s", i, r:GetFullName()))
-    end
-end
-if #receiveTargets > 0 then
-    print("[Init] ReceiveTargets tìm thấy:")
-    for i, r in ipairs(receiveTargets) do
-        print(string.format("  [%d] %s", i, r:GetFullName()))
+local function MathOn()
+    math.random = function(...)
+        if not IsEnabled then return OriginalMathRandom(...) end
+        local n = select("#", ...)
+        if n == 0 then return OriginalMathRandom() * 0.39
+        elseif n == 1 then return ...
+        elseif n == 2 then return select(2, ...) end
+        return OriginalMathRandom(...)
     end
 end
 
--- Tìm MoneyRemote
-MoneyRemote = FindMoneyRemote()
-if MoneyRemote then
-    print(string.format("[Init] MoneyRemote: %s", MoneyRemote:GetFullName()))
-else
-    print("[Init] MoneyRemote: KHÔNG tìm thấy")
+local function MathOff()
+    math.random = OriginalMathRandom
 end
 
--- Hook kết quả
-local hooked = HookAllResults(receiveTargets)
-print(string.format("[Init] Đã hook %d sự kiện", hooked))
+-- ==========================================
+-- BẬT / TẮT
+-- ==========================================
+local function Enable()
+    IsEnabled = true; MathOn()
+end
 
--- Theo dõi tiền
-MonitorMoneyChanges()
+local function Disable()
+    IsEnabled = false; MathOff()
+end
+
+local function Toggle()
+    if IsEnabled then Disable() else Enable() end
+    return IsEnabled
+end
 
 -- ==========================================
--- GIAO DIỆN
+-- GIAO DIỆN MOBILE (SWITCH TOGGLE)
 -- ==========================================
 local SG = Instance.new("ScreenGui")
-SG.Name = "Double100"
+SG.Name = "MobileDouble"
 SG.Parent = LocalPlayer:WaitForChild("PlayerGui")
 SG.ResetOnSpawn = false
+SG.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+SG.IgnoreGuiInset = true
 
-local Frame = Instance.new("Frame")
-Frame.Parent = SG
-Frame.BackgroundColor3 = Color3.fromRGB(10, 20, 10)
-Frame.BorderSizePixel = 0
-Frame.Size = UDim2.new(0, 220, 0, 70)
-Frame.Position = UDim2.new(1, -230, 0, 10)
+-- Kích thước màn hình
+local screenSize = workspace.CurrentCamera.ViewportSize
+local screenWidth = screenSize.X
+local screenHeight = screenSize.Y
 
-Instance.new("UICorner", Frame).CornerRadius = UDim.new(0, 10)
+-- Panel chính
+local Panel = Instance.new("Frame")
+Panel.Name = "Panel"
+Panel.Parent = SG
+Panel.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
+Panel.BorderSizePixel = 0
+Panel.Size = UDim2.new(0, math.min(320, screenWidth - 20), 0, 200)
+Panel.Position = UDim2.new(0.5, -math.min(320, screenWidth - 20)/2, 0.06, 0)
+Panel.Active = true
+Panel.Draggable = true
 
-local Label = Instance.new("TextLabel")
-Label.Parent = Frame
-Label.BackgroundTransparency = 1
-Label.Size = UDim2.new(1, 0, 1, 0)
-Label.Font = Enum.Font.GothamBold
-Label.Text = "DOUBLE: 100%"
-Label.TextColor3 = Color3.fromRGB(0, 255, 80)
-Label.TextSize = 16
+local PanelCorner = Instance.new("UICorner")
+PanelCorner.CornerRadius = UDim.new(0, 20)
+PanelCorner.Parent = Panel
+
+-- Viền
+local PanelStroke = Instance.new("UIStroke")
+PanelStroke.Parent = Panel
+PanelStroke.Thickness = 1.5
+PanelStroke.Color = Color3.fromRGB(50, 55, 65)
+
+-- Tiêu đề
+local Title = Instance.new("TextLabel")
+Title.Parent = Panel
+Title.BackgroundTransparency = 1
+Title.Size = UDim2.new(1, -40, 0, 36)
+Title.Position = UDim2.new(0, 20, 0, 14)
+Title.Font = Enum.Font.GothamBold
+Title.Text = "🎰 DOUBLE RATE 100%"
+Title.TextColor3 = Color3.fromRGB(255, 210, 50)
+Title.TextSize = 18
+Title.TextXAlignment = Enum.TextXAlignment.Left
+
+-- ==========================================
+-- THÔNG TIN TỈ LỆ
+-- ==========================================
+local RateFrame = Instance.new("Frame")
+RateFrame.Parent = Panel
+RateFrame.BackgroundColor3 = Color3.fromRGB(28, 30, 38)
+RateFrame.BorderSizePixel = 0
+RateFrame.Size = UDim2.new(1, -40, 0, 50)
+RateFrame.Position = UDim2.new(0, 20, 0, 56)
+
+local RateCorner = Instance.new("UICorner")
+RateCorner.CornerRadius = UDim.new(0, 12)
+RateCorner.Parent = RateFrame
+
+local RateLeft = Instance.new("TextLabel")
+RateLeft.Parent = RateFrame
+RateLeft.BackgroundTransparency = 1
+RateLeft.Size = UDim2.new(0.5, -5, 0, 22)
+RateLeft.Position = UDim2.new(0, 10, 0, 4)
+RateLeft.Font = Enum.Font.GothamBold
+RateLeft.Text = "Gốc: 40%"
+RateLeft.TextColor3 = Color3.fromRGB(255, 110, 110)
+RateLeft.TextSize = 14
+RateLeft.TextXAlignment = Enum.TextXAlignment.Left
+
+local RateRight = Instance.new("TextLabel")
+RateRight.Name = "RateRight"
+RateRight.Parent = RateFrame
+RateRight.BackgroundTransparency = 1
+RateRight.Size = UDim2.new(0.5, -5, 0, 22)
+RateRight.Position = UDim2.new(0.5, 5, 0, 4)
+RateRight.Font = Enum.Font.GothamBold
+RateRight.Text = "Hiện tại: 100%"
+RateRight.TextColor3 = Color3.fromRGB(80, 255, 120)
+RateRight.TextSize = 14
+RateRight.TextXAlignment = Enum.TextXAlignment.Left
+
+local CountLabel = Instance.new("TextLabel")
+CountLabel.Name = "CountLabel"
+CountLabel.Parent = RateFrame
+CountLabel.BackgroundTransparency = 1
+CountLabel.Size = UDim2.new(1, -20, 0, 20)
+CountLabel.Position = UDim2.new(0, 10, 0, 27)
+CountLabel.Font = Enum.Font.Gotham
+CountLabel.Text = "✅ 0  |  ❌ 0"
+CountLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+CountLabel.TextSize = 11
+CountLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+-- ==========================================
+-- SWITCH TOGGLE (KIỂU iOS)
+-- ==========================================
+local SwitchFrame = Instance.new("Frame")
+SwitchFrame.Parent = Panel
+SwitchFrame.BackgroundTransparency = 1
+SwitchFrame.Size = UDim2.new(0, 64, 0, 34)
+SwitchFrame.Position = UDim2.new(1, -90, 0, 120)
+
+-- Track
+local Track = Instance.new("Frame")
+Track.Name = "Track"
+Track.Parent = SwitchFrame
+Track.BackgroundColor3 = Color3.fromRGB(52, 199, 89)
+Track.BorderSizePixel = 0
+Track.Size = UDim2.new(1, 0, 1, 0)
+
+local TrackCorner = Instance.new("UICorner")
+TrackCorner.CornerRadius = UDim.new(1, 0)
+TrackCorner.Parent = Track
+
+-- Thumb
+local Thumb = Instance.new("Frame")
+Thumb.Name = "Thumb"
+Thumb.Parent = Track
+Thumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+Thumb.BorderSizePixel = 0
+Thumb.Size = UDim2.new(0, 28, 0, 28)
+Thumb.Position = UDim2.new(1, -31, 0.5, -14)
+
+local ThumbCorner = Instance.new("UICorner")
+ThumbCorner.CornerRadius = UDim.new(1, 0)
+ThumbCorner.Parent = Thumb
+
+-- Bóng Thumb
+local Shadow = Instance.new("ImageLabel")
+Shadow.Parent = Thumb
+Shadow.BackgroundTransparency = 1
+Shadow.Size = UDim2.new(1.3, 0, 1.3, 0)
+Shadow.Position = UDim2.new(-0.15, 0, -0.15, 0)
+Shadow.Image = "rbxassetid://6015897843"
+Shadow.ImageTransparency = 0.55
+Shadow.ScaleType = Enum.ScaleType.Slice
+Shadow.SliceCenter = Rect.new(8, 8, 8, 8)
+
+-- Label ON/OFF
+local SwitchLabel = Instance.new("TextLabel")
+SwitchLabel.Name = "SwitchLabel"
+SwitchLabel.Parent = Panel
+SwitchLabel.BackgroundTransparency = 1
+SwitchLabel.Size = UDim2.new(0, 80, 0, 28)
+SwitchLabel.Position = UDim2.new(0, 24, 0, 123)
+SwitchLabel.Font = Enum.Font.GothamBlack
+SwitchLabel.Text = "BẬT"
+SwitchLabel.TextColor3 = Color3.fromRGB(80, 255, 120)
+SwitchLabel.TextSize = 20
+SwitchLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+-- ==========================================
+-- NÚT ẨN (TOUCH AREA)
+-- ==========================================
+local TouchBtn = Instance.new("TextButton")
+TouchBtn.Parent = SwitchFrame
+TouchBtn.BackgroundTransparency = 1
+TouchBtn.Size = UDim2.new(2, 0, 2, 0)
+TouchBtn.Position = UDim2.new(-0.5, 0, -0.5, 0)
+TouchBtn.Text = ""
+
+-- ==========================================
+-- DÒNG TRẠNG THÁI REMOTE
+-- ==========================================
+local RemoteInfo = Instance.new("TextLabel")
+RemoteInfo.Name = "RemoteInfo"
+RemoteInfo.Parent = Panel
+RemoteInfo.BackgroundTransparency = 1
+RemoteInfo.Size = UDim2.new(1, -40, 0, 20)
+RemoteInfo.Position = UDim2.new(0, 20, 0, 170)
+RemoteInfo.Font = Enum.Font.Gotham
+RemoteInfo.Text = ""
+RemoteInfo.TextColor3 = Color3.fromRGB(140, 140, 145)
+RemoteInfo.TextSize = 10
+RemoteInfo.TextXAlignment = Enum.TextXAlignment.Left
+
+-- ==========================================
+-- ANIMATION SWITCH
+-- ==========================================
+local switchTween = nil
+
+local function AnimateSwitch(on)
+    local thumbGoal
+    local trackColor
+    local labelText
+    local labelColor
+    local rateText
+    local rateColor
+    
+    if on then
+        thumbGoal = UDim2.new(1, -31, 0.5, -14)
+        trackColor = Color3.fromRGB(52, 199, 89)
+        labelText = "BẬT"
+        labelColor = Color3.fromRGB(80, 255, 120)
+        rateText = "Hiện tại: 100%"
+        rateColor = Color3.fromRGB(80, 255, 120)
+    else
+        thumbGoal = UDim2.new(0, 3, 0.5, -14)
+        trackColor = Color3.fromRGB(70, 70, 75)
+        labelText = "TẮT"
+        labelColor = Color3.fromRGB(255, 100, 100)
+        rateText = "Hiện tại: 40% (Gốc)"
+        rateColor = Color3.fromRGB(255, 110, 110)
+    end
+    
+    if switchTween then switchTween:Cancel() end
+    
+    local ti = TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+    switchTween = TweenService:Create(Thumb, ti, {Position = thumbGoal})
+    switchTween:Play()
+    
+    TweenService:Create(Track, TweenInfo.new(0.25), {BackgroundColor3 = trackColor}):Play()
+    
+    SwitchLabel.Text = labelText
+    SwitchLabel.TextColor3 = labelColor
+    RateRight.Text = rateText
+    RateRight.TextColor3 = rateColor
+end
+
+-- ==========================================
+-- SỰ KIỆN
+-- ==========================================
+TouchBtn.MouseButton1Click:Connect(function()
+    Toggle()
+    AnimateSwitch(IsEnabled)
+end)
+
+TouchBtn.TouchTap:Connect(function()
+    Toggle()
+    AnimateSwitch(IsEnabled)
+end)
+
+-- ==========================================
+-- CẬP NHẬT SỐ LIỆU
+-- ==========================================
+task.spawn(function()
+    while true do
+        task.wait(1.5)
+        CountLabel.Text = string.format("✅ %d  |  ❌ %d", DoubleCount, FailBlocked)
+    end
+end)
+
+-- ==========================================
+-- KHỞI TẠO
+-- ==========================================
+MoneyValue = FindMoney()
+MoneyRemote = FindMoneyRemote()
+HookAll()
+MonitorMoney()
+MathOn()
+AnimateSwitch(true)
+
+if MoneyValue then
+    RemoteInfo.Text = string.format("💰 %s: %d  |  📡 Server: %s", 
+        MoneyValue.Name, MoneyValue.Value, MoneyRemote and "✅" or "⚠️")
+else
+    RemoteInfo.Text = "⏳ Đang chờ dữ liệu..."
+end
 
 print([[
 ============================================
-  HOẠT ĐỘNG:
-  
-  Khi Double thất bại:
-  1. Chặn kết quả NOTHING
-  2. Gửi tiền hoàn lại ×2 qua MoneyRemote
-  3. Cập nhật Client-side
-  
-  Hạn chế đã xử lý:
-  ✅ Mọi dạng kết quả (String/Boolean/Number)
-  ✅ Cả RemoteEvent & RemoteFunction
-  ✅ Tự động hoàn tiền khi thua
-  ✅ Math.random ghi đè
+  MOBILE DOUBLE 100% - READY
+  Chạm công tắc để BẬT/TẮT
 ============================================
 ]])
 
